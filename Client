@@ -1,0 +1,93 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+
+// Run-Length Encoding function
+char* run_length_encode(char* input) {
+    int len = strlen(input);
+    char* encoded = malloc(len * 2 + 1); // Worst case, no compression
+    int count = 1, j = 0;
+
+    for (int i = 0; i < len; i++) {
+        if (input[i] == input[i + 1]) {
+            count++;
+        } else {
+            j += sprintf(&encoded[j], "%d%c", count, input[i]);
+            count = 1;
+        }
+    }
+    encoded[j] = '\0';
+    return encoded;
+}
+
+// Function to send file data to the server
+void send_file_data(int sock, const char* file_path) {
+    FILE* file = fopen(file_path, "r");
+    if (file == NULL) {
+        perror("File open error");
+        return;
+    }
+
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+
+    // Read the file, encode it, and send it to the server
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE - 1, file)) > 0) {
+        buffer[bytes_read] = '\0'; // Null-terminate the buffer
+        char* encoded_data = run_length_encode(buffer); // Encode file data
+        send(sock, encoded_data, strlen(encoded_data), 0);
+        free(encoded_data);
+    }
+
+    fclose(file);
+}
+
+int main() {
+    int sock;
+    struct sockaddr_in server_addr;
+    char server_reply[BUFFER_SIZE];
+
+    // Create socket
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        printf("Could not create socket\n");
+        return -1;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    // Connect to the server
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection failed");
+        return -1;
+    }
+
+    // Send upload request
+    char* file_path = "/path/to/sample.txt";
+    char upload_request[BUFFER_SIZE];
+    sprintf(upload_request, "$UPLOAD$%s$", file_path);
+    send(sock, upload_request, strlen(upload_request), 0);
+
+    // Receive server response
+    if (recv(sock, server_reply, BUFFER_SIZE, 0) < 0) {
+        perror("Receive failed");
+        return -1;
+    }
+    printf("Server reply: %s\n", server_reply);
+
+    // If server is ready for file upload, send the file data
+    if (strstr(server_reply, "$SUCCESS$") != NULL) {
+        send_file_data(sock, file_path);
+    }
+
+    // Close the connection
+    close(sock);
+    return 0;
+}
