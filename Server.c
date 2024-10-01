@@ -1,50 +1,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include <sys/socket.h>
+#include <sqlite3.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <openssl/sha.h>
 #include <dirent.h>
-#include <errno.h>
+#include <pthread.h>
 
 #define PORT 8080
-#define STORAGE_LIMIT 10240 // 10 KB
 #define BUFFER_SIZE 1024
-#define MAX_PATH_SIZE 2048 // Updated buffer size to handle large paths
+#define DB_NAME "clients.db"
 
-pthread_mutex_t lock;
+// Function prototypes
+void init_db();
+char* run_length_decode(char* input);
+int sign_up(const char* username, const char* password);
+int login(const char* username, const char* password);
+void* handle_client(void* arg);
+void create_user_directory(int user_id);
+void send_response(int client_socket, const char* message);
+void handle_upload(int client_socket, int user_id, const char* filename);
+void handle_view(int client_socket, int user_id);
+void handle_download(int client_socket, int user_id, const char* filename);
 
-void* handle_client(void* client_socket);
-
-long get_file_size(const char* filename) {
-    struct stat st;
-    if (stat(filename, &st) == 0) {
-        return st.st_size;
-    }
-    return -1;
-}
-
-int get_total_storage_usage() {
-    DIR* dir = opendir("uploads");
-    struct dirent* entry;
-    int total_size = 0;
-
-    if (dir != NULL) {
-        while ((entry = readdir(dir)) != NULL) {
-            char filepath[MAX_PATH_SIZE]; // Increased buffer size for file path
-            snprintf(filepath, sizeof(filepath), "uploads/%s", entry->d_name);
-            
-            struct stat file_stat;
-            if (stat(filepath, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) { // Check if it's a regular file
-                total_size += get_file_size(filepath);
-            }
-        }
-        closedir(dir);
-    }
-    return total_size;
-}
+// Mutex for thread safety
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 char* run_length_decode(char* input) {
     int len = strlen(input);
@@ -62,224 +45,313 @@ char* run_length_decode(char* input) {
     return decoded;
 }
 
-void get_client_id(int client_socket, char* client_id, size_t size) {
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    getpeername(client_socket, (struct sockaddr*)&addr, &addr_len);
+// Initialize SQLite DB and create table if not exists
+void init_db() {
+    sqlite3* db;
+    char* err_msg = 0;
+    int rc = sqlite3_open(DB_NAME, &db);
+    
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        exit(1);
+    }
 
-    // Using IP address and port as client identifier
-    snprintf(client_id, size, "%s_%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+    const char* sql = "CREATE TABLE IF NOT EXISTS clients ("
+                      "user_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                      "username TEXT UNIQUE,"
+                      "password_hash TEXT,"
+                      "created_at TEXT);";
+    
+    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        exit(1);
+    }
+    
+    sqlite3_close(db);
 }
 
-void handle_upload(int client_socket, char* file_path) {
-    char buffer[BUFFER_SIZE];
-    int received_size;
-    FILE* file;
-    char client_id[MAX_PATH_SIZE];  // To store client identifier
-    char dir_path[MAX_PATH_SIZE];   // To store client directory path
-    char file_name[MAX_PATH_SIZE];  // To store full file path
+// Hash password using SHA256
+char* hash_password(const char* password) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((unsigned char*)password, strlen(password), hash);
 
-    // Generate client ID based on IP and port or some unique identifier
-    get_client_id(client_socket, client_id, sizeof(client_id));
-
-    // Create directory for client if it doesn't exist
-    int result = snprintf(dir_path, sizeof(dir_path), "uploads/%s", client_id);
-    if (result >= sizeof(dir_path)) {
-        send(client_socket, "$FAILURE$PATH_TOO_LONG$", strlen("$FAILURE$PATH_TOO_LONG$"), 0);
-        return;
+    // Convert hash to hex string
+    char* hash_str = malloc(2 * SHA256_DIGEST_LENGTH + 1);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(&hash_str[i * 2], "%02x", hash[i]);
     }
-    if (mkdir(dir_path, 0755) == -1 && errno != EEXIST) {
-        perror("Error creating client directory");
-        send(client_socket, "$FAILURE$DIR_CREATE_ERROR$", strlen("$FAILURE$DIR_CREATE_ERROR$"), 0);
-        return;
+    return hash_str;
+}
+
+// Send response message to client
+void send_response(int client_socket, const char* message) {
+    send(client_socket, message, strlen(message), 0);
+}
+
+// Sign-up function: stores a new user in the database
+int sign_up(const char* username, const char* password) {
+    sqlite3* db;
+    sqlite3_open(DB_NAME, &db);
+
+    char* err_msg = 0;
+    char* hashed_password = hash_password(password);
+
+    char sql[BUFFER_SIZE];
+    snprintf(sql, sizeof(sql), "INSERT INTO clients (username, password_hash, created_at) "
+                               "VALUES ('%s', '%s', datetime('now'));", username, hashed_password);
+
+    int rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    free(hashed_password);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return -1;  // Sign-up failed
     }
 
-    // Build the full path for the file in the client's directory
-    printf("file_path: %s\n", file_path);
-    printf("dir_path: %s\n", dir_path);
-    printf("file_name_only: %s\n", file_name);
-    snprintf(file_name, sizeof(file_name), "%s/%s", dir_path, strrchr(file_path, '/') + 1);
+    int user_id = sqlite3_last_insert_rowid(db);  // Get the user_id of the new user
+    sqlite3_close(db);
+    return user_id;  // Return new user's ID
+}
 
-    if (result >= sizeof(file_name)) {
-    send(client_socket, "$FAILURE$FILE_NAME_TOO_LONG$", strlen("$FAILURE$FILE_NAME_TOO_LONG$"), 0);
-    return;
+// Login function: validates username and password
+int login(const char* username, const char* password) {
+    sqlite3* db;
+    sqlite3_open(DB_NAME, &db);
+
+    char* hashed_password = hash_password(password);
+    char sql[BUFFER_SIZE];
+    snprintf(sql, sizeof(sql), "SELECT user_id FROM clients WHERE username='%s' AND password_hash='%s';", 
+             username, hashed_password);
+
+    sqlite3_stmt* stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    free(hashed_password);
+
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to execute query: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
     }
-    if (get_total_storage_usage() + BUFFER_SIZE > STORAGE_LIMIT) {
-        send(client_socket, "$FAILURE$LOW_SPACE$", strlen("$FAILURE$LOW_SPACE$"), 0);
-        return;
+
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        int user_id = sqlite3_column_int(stmt, 0);  // Get the user_id if login is successful
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return user_id;
     } else {
-        send(client_socket, "$SUCCESS$", strlen("$SUCCESS$"), 0);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;  // Invalid credentials
     }
-
-    // Open file for writing
-    file = fopen(file_name, "w");
-    if (file == NULL) {
-        perror("File open error");
-        send(client_socket, "$FAILURE$FILE_OPEN_ERROR$", strlen("$FAILURE$FILE_OPEN_ERROR$"), 0);
-        return;
-    }
-
-    // Receive file data and write to file
-    while ((received_size = recv(client_socket, buffer, BUFFER_SIZE, 0)) > 0) {
-        buffer[received_size] = '\0';
-        char* decoded_data = run_length_decode(buffer); // Decode the data
-        fwrite(decoded_data, sizeof(char), strlen(decoded_data), file);
-        free(decoded_data);
-    }
-
-    fclose(file);
-    send(client_socket, "$SUCCESS$", strlen("$SUCCESS$"), 0);
 }
 
-void handle_view(int client_socket) {
-    DIR* dir;
-    struct dirent* entry;
-    char response[BUFFER_SIZE] = "";
-    char client_id[MAX_PATH_SIZE];  // To store client identifier
-    char dir_path[MAX_PATH_SIZE];   // To store client directory path
+// Create a directory for the user if it doesn't exist
+void create_user_directory(int user_id) {
+    char dir_path[BUFFER_SIZE];
+    snprintf(dir_path, sizeof(dir_path), "uploads/%d", user_id);
+    mkdir(dir_path, 0777);
+}
 
-    // Get client ID based on IP and port or some unique identifier
-    get_client_id(client_socket, client_id, sizeof(client_id));
-
-    // Open the client's directory
-    int result = snprintf(dir_path, sizeof(dir_path), "uploads/%s", client_id);
-    if (result >= sizeof(dir_path)) {
-    send(client_socket, "$FAILURE$PATH_TOO_LONG$", strlen("$FAILURE$PATH_TOO_LONG$"), 0);
-    return;
-    }
-    dir = opendir(dir_path);
-
-    if (dir == NULL) {
-        send(client_socket, "$FAILURE$NO_CLIENT_DATA$", strlen("$FAILURE$NO_CLIENT_DATA$"), 0);
+// Handle file upload from client
+void handle_upload(int client_socket, int user_id, const char* filename) {
+    char filepath[BUFFER_SIZE];
+    snprintf(filepath, sizeof(filepath), "uploads/%d/%s", user_id, filename);
+    printf(filepath);
+    FILE* file = fopen(filepath, "wb");
+    if (file == NULL) {
+        send_response(client_socket, "$UPLOAD_FAILURE$");
         return;
     }
 
-    // Read the files in the client's directory
+    char buffer[BUFFER_SIZE];
+    int bytes_received;
+    while ((bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0)) > 0) {
+        char* decoded = run_length_decode(buffer);
+        fwrite(decoded, 1, strlen(decoded), file);
+        free(decoded);
+        if (bytes_received < BUFFER_SIZE) {
+            break; // End of file
+        }
+    }
+    
+    fclose(file);
+    send_response(client_socket, "$UPLOAD_SUCCESS$");
+    printf("Server: File uploaded successfully to %s\n", filepath);
+}
+
+// Handle file viewing (list files in user's directory)
+void handle_view(int client_socket, int user_id) {
+    char dir_path[BUFFER_SIZE];
+    snprintf(dir_path, sizeof(dir_path), "uploads/%d", user_id);
+
+    DIR* dir = opendir(dir_path);
+    if (dir == NULL) {
+        send_response(client_socket, "$VIEW_FAILURE$");
+        return;
+    }
+
+    struct dirent* entry;
+    char file_list[BUFFER_SIZE] = "";
+    struct stat file_stat;
+    char full_path[BUFFER_SIZE];
+    
     while ((entry = readdir(dir)) != NULL) {
-        char filepath[MAX_PATH_SIZE];  // Increased buffer size for file path
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
 
-        result = snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, entry->d_name);
-        if (result >= sizeof(filepath)) {
-            send(client_socket, "$FAILURE$FILE_PATH_TOO_LONG$", strlen("$FAILURE$FILE_PATH_TOO_LONG$"), 0);
-            return;
-        }
-
-        struct stat file_stat;
-        if (stat(filepath, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) { // Check if it's a regular file
-            char file_info[MAX_PATH_SIZE];  // Increased buffer size for file info
-            result = snprintf(file_info, sizeof(file_info), "File: %s, Size: %ld bytes\n", entry->d_name, file_stat.st_size);
-            if (result >= sizeof(filepath)) {
-            send(client_socket, "$FAILURE$FILE_PATH_TOO_LONG$", strlen("$FAILURE$FILE_PATH_TOO_LONG$"), 0);
-            return;
-        }
-            strcat(response, file_info);
+        // Use stat() to check if the entry is a regular file
+        if (stat(full_path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+            strcat(file_list, entry->d_name);
+            strcat(file_list, "\n");
         }
     }
     closedir(dir);
 
-    if (strlen(response) == 0) {
-        send(client_socket, "$FAILURE$NO_CLIENT_DATA$", strlen("$FAILURE$NO_CLIENT_DATA$"), 0);
-    } else {
-        send(client_socket, response, strlen(response), 0);
+    if (strlen(file_list) == 0) {
+        strcpy(file_list, "No files found\n");
     }
+
+    send_response(client_socket, file_list);
 }
 
-void handle_download(int client_socket, char* file_name) {
-    char buffer[BUFFER_SIZE];
-    FILE* file;
-    char client_id[MAX_PATH_SIZE];  // To store client identifier
-    char file_path[MAX_PATH_SIZE];  // To store file path inside the client's directory
+// Handle file download request
+void handle_download(int client_socket, int user_id, const char* filename) {
+    char filepath[BUFFER_SIZE];
+    snprintf(filepath, sizeof(filepath), "uploads/%d/%s", user_id, filename);
 
-    // Get client ID based on IP and port or some unique identifier
-    get_client_id(client_socket, client_id, sizeof(client_id));
-
-    // Build the file path within the client's directory
-   int result = snprintf(file_path, sizeof(file_path), "uploads/%s/%s", client_id, file_name);
-    if (result >= sizeof(file_path)) {
-        send(client_socket, "$FAILURE$FILE_PATH_TOO_LONG$", strlen("$FAILURE$FILE_PATH_TOO_LONG$"), 0);
-        return;
-    }
-
-    // Try to open the file for reading
-    file = fopen(file_path, "r");
+    FILE* file = fopen(filepath, "rb");
     if (file == NULL) {
-        send(client_socket, "$FAILURE$FILE_NOT_FOUND$", strlen("$FAILURE$FILE_NOT_FOUND$"), 0);
+        send_response(client_socket, "$DOWNLOAD_FAILURE$");
         return;
     }
 
-    // Read the file and send it to the client
-    while (fgets(buffer, sizeof(buffer), file) != NULL) {
-        send(client_socket, buffer, strlen(buffer), 0);
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
+        send(client_socket, buffer, bytes_read, 0);
     }
+    
     fclose(file);
+    send_response(client_socket, "$DOWNLOAD_SUCCESS$");
+    printf("Server: File downloaded: %s\n", filepath);
 }
 
-void* handle_client(void* client_socket) {
-    //int sock = ((int)client_socket);
-    //int sock = client_socket;  // Remove the cast to (int)
-    int sock = *(int*)client_socket;  // Cast from void* to int*
+// Handle client connection (sign-up, login, upload, view, download)
+void* handle_client(void* arg) {
+    int client_socket = *((int*)arg);
+    free(arg);
 
     char buffer[BUFFER_SIZE];
-    int received_size;
-
-    while ((received_size = recv(sock, buffer, BUFFER_SIZE, 0)) > 0) {
-        buffer[received_size] = '\0';
-        if (strstr(buffer, "$UPLOAD$") == buffer) {
-            char* file_path = strtok(buffer + 8, "$");
-            handle_upload(sock, file_path);
-        } else if (strstr(buffer, "$VIEW$") == buffer) {
-            handle_view(sock);
-        } else if (strstr(buffer, "$DOWNLOAD$") == buffer) {
-            char* file_name = strtok(buffer + 10, "$");
-            handle_download(sock, file_name);
+    char username[BUFFER_SIZE], password[BUFFER_SIZE], filename[BUFFER_SIZE];
+    
+    int user_id = -1; // Keep track of logged-in user
+    
+    while (1) {
+        memset(buffer, 0, BUFFER_SIZE);
+        recv(client_socket, buffer, BUFFER_SIZE, 0);
+        
+        if (strstr(buffer, "$SIGNUP$") != NULL) {
+            sscanf(buffer, "$SIGNUP$%[^$]$%[^$]$", username, password);
+            printf("Server: Signing up user with username: %s\n", username);
+            
+            pthread_mutex_lock(&mutex);
+            user_id = sign_up(username, password);
+ pthread_mutex_unlock(&mutex);
+            if (user_id != -1) {
+                create_user_directory(user_id);  // Create user's directory on successful sign-up
+                send_response(client_socket, "$SIGNUP_SUCCESS$");
+                printf("Server: Sign-up success for user: %s\n", username);
+            } else {
+                send_response(client_socket, "$SIGNUP_FAILURE$");
+                printf("Server: Sign-up failed for user: %s\n", username);
+            }
+        } else if (strstr(buffer, "$LOGIN$") != NULL) {
+            sscanf(buffer, "$LOGIN$%[^$]$%[^$]$", username, password);
+            printf("Server: Logging in user with username: %s\n", username);
+            
+            pthread_mutex_lock(&mutex);
+            user_id = login(username, password);
+            pthread_mutex_unlock(&mutex);
+            if (user_id != -1) {
+                send_response(client_socket, "$LOGIN_SUCCESS$");
+                printf("Server: Login success for user: %s\n", username);
+            } else {
+                send_response(client_socket, "$LOGIN_FAILURE$");
+                printf("Server: Login failed for user: %s\n", username);
+            }
+        } else if (strstr(buffer, "$UPLOAD$") != NULL && user_id != -1) {
+            sscanf(buffer, "$UPLOAD$%[^$]$", filename);
+            printf("Server: File upload requested: %s\n", filename);
+            handle_upload(client_socket, user_id, filename);
+        } else if (strstr(buffer, "$VIEW$") != NULL && user_id != -1) {
+            printf("Server: File view requested\n");
+            handle_view(client_socket, user_id);
+        } else if (strstr(buffer, "$DOWNLOAD$") != NULL && user_id != -1) {
+            sscanf(buffer, "$DOWNLOAD$%[^$]$", filename);
+            printf("Server: File download requested: %s\n", filename);
+            handle_download(client_socket, user_id, filename);
         }
     }
-
-    close(sock);
-    free(client_socket);
+    close(client_socket);
     return NULL;
 }
 
 int main() {
-    int server_fd, client_socket, *new_sock;
+    int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_len = sizeof(struct sockaddr_in);
+    socklen_t addr_size = sizeof(struct sockaddr_in);
 
-    // Suppress error if directory already exists
-    if (mkdir("uploads", 0777) == -1 && errno != EEXIST) {
-        perror("Error creating uploads directory");
-        exit(EXIT_FAILURE);
-    }
+    init_db();  // Initialize the SQLite database
 
-    pthread_mutex_init(&lock, NULL);
-    
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1) {
-        perror("Socket failed");
-        exit(EXIT_FAILURE);
+    // Create socket
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        perror("Server: Socket creation failed");
+        exit(1);
     }
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+    // Bind the socket to the port
+    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Server: Bind failed");
+        exit(1);
     }
 
-    listen(server_fd, 5);
-    printf("Server listening on port %d\n", PORT);
-
-    while ((client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len))) {
-        printf("Client connected\n");
-        pthread_t client_thread;
-        new_sock = malloc(sizeof(int));
-        *new_sock = client_socket;
-        pthread_create(&client_thread, NULL, handle_client, (void*)new_sock);
+    // Listen for connections
+    if (listen(server_socket, 3) < 0) {
+        perror("Server: Listen failed");
+        exit(1);
     }
 
-    pthread_mutex_destroy(&lock);
+    printf("Server is running on port %d\n", PORT);
+
+    // Accept incoming connections
+    while (1) {
+        client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &addr_size);
+        if (client_socket < 0) {
+            perror("Server: Accept failed");
+            continue;
+        }
+
+        printf("Server: Client connected\n");
+
+        // Handle the client in a separate thread
+        pthread_t thread;
+        int* client_socket_ptr = malloc(sizeof(int));
+        *client_socket_ptr = client_socket;
+        pthread_create(&thread, NULL, handle_client, client_socket_ptr);
+    }
+
+    close(server_socket);
     return 0;
 }
